@@ -1,0 +1,34 @@
+# Web Framework & API
+fastapi
+uvicorn
+python-dotenv
+pydantic
+
+# Database
+pymongo
+motor
+
+# Web Scraping & Browser Automation
+playwright
+beautifulsoup4
+httpx
+requests
+
+# Task Scheduling & Queues
+celery
+redis
+
+# Data Processing & Index Engine
+pandas
+numpy
+
+# Utilities & Security
+PyJWT
+python-jose[cryptography]
+bcrypt
+python-dateutil
+pytz
+
+# Testing
+pytest
+pytest-asyncio
