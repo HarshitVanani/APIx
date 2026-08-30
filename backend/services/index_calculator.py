@@ -1,178 +1,121 @@
-import logging
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
-from scipy import stats
-from enum import Enum
-from .dgca_service import DGCAService
+from datetime import datetime, timezone
+from motor.motor_asyncio import AsyncIOMotorClient
+import logging
 
-logger = logging.getLogger("APIxEngine")
-
-
-class IndexType(str, Enum):
-    DAILY = "daily"
-    WEEKLY = "weekly"
-    MONTHLY = "monthly"
+logger = logging.getLogger("APIx.IndexCalculator")
 
 
-class APIxCalculationEngine:
+class AirfarePriceIndexEngine:
     """
-    Advanced statistical index calculation engine for APIx (Airfare Price Index).
-    
-    Methodology:
-    1. Weighted average fare calculation using DGCA traffic weights
-    2. Base period indexation (Base 100 = reference period)
-    3. Confidence interval calculation using bootstrap resampling
-    4. Trend analysis (MoM, YoY, 90-day volatility)
-    5. Multi-factor data quality scoring (Volume, Diversity, Consistency)
+    Computes the Stratified Jevons / Weighted Laspeyres Real-Time Airfare Index.
+    Integrates advance purchase windows (T+1 to T+45) and DGCA route baskets.
     """
 
-    BASE_INDEX_VALUE = 100.0
-    BASE_PERIOD = "2023-12"
-    MIN_DATA_POINTS = 3
-
-    # Calibrated baseline route averages
-    DEFAULT_BASE_FARES = {
-        "DEL-BOM": 4800.0,
-        "BOM-DEL": 4750.0,
-        "BLR-DEL": 5200.0,
-        "DEL-BLR": 5150.0,
-        "BOM-BLR": 3600.0,
-        "DEL-CCU": 4900.0,
-        "BOM-GOI": 3200.0,
-        "DEL-HYD": 4100.0,
+    # Advance purchase window weights (representative of domestic booking patterns)
+    WINDOW_WEIGHTS = {
+        1: 0.15,   # T+1: Emergency / Business Last-Minute
+        7: 0.35,   # T+7: Short-term demand
+        15: 0.25,  # T+15: Standard advance booking
+        30: 0.15,  # T+30: Vacation / Planned
+        45: 0.10,  # T+45: Early bird
     }
 
-    def __init__(self, route_weights: Optional[Dict[str, float]] = None):
-        self.route_weights = route_weights or DGCAService.get_route_weights()
-        self.base_fare_level = self.DEFAULT_BASE_FARES.copy()
+    def __init__(self, mongo_uri: str = "mongodb://localhost:27017", db_name: str = "apix_db"):
+        self.client = AsyncIOMotorClient(mongo_uri)
+        self.db = self.client[db_name]
 
-    def set_base_fare_level(self, base_fares: List[Dict]):
-        """Set baseline fare level from historical reference records."""
-        base_df = pd.DataFrame(base_fares)
-        route_baselines = {}
+    async def calculate_daily_apix(self, target_date: datetime) -> dict:
+        start_bound = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=timezone.utc)
+        end_bound = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59, tzinfo=timezone.utc)
 
-        for route_id in self.route_weights.keys():
-            orig, dest = route_id.split("-") if "-" in route_id else (route_id[:3], route_id[3:])
-            route_data = base_df[
-                ((base_df.get('route_from') == orig) & (base_df.get('route_to') == dest)) |
-                (base_df.get('route_id') == route_id)
-            ]
+        cursor = self.db["raw_fares"].find({
+            "scraped_at": {"$gte": start_bound, "$lte": end_bound}
+        })
+        records = await cursor.to_list(length=100000)
 
-            if len(route_data) > 0:
-                route_baselines[route_id] = float(route_data['total_price'].mean())
-            else:
-                route_baselines[route_id] = self.DEFAULT_BASE_FARES.get(route_id, 4500.0)
+        if not records:
+            logger.warning(f"No fare records found for {target_date.date()}. Aborting index calculation.")
+            return {}
 
-        self.base_fare_level = route_baselines
+        df = pd.DataFrame(records)
 
-    def calculate_daily_index(self, daily_fares: List[Dict], date: Optional[datetime] = None) -> Dict:
-        calc_date = date or datetime.utcnow()
+        # 1. Outlier Removal via Route & Window Interquartile Range (IQR)
+        cleaned_frames = []
+        for (route, window), group in df.groupby(["origin_iata", "destination_iata", "advance_purchase_window"]):
+            q1 = group["total_fare"].quantile(0.25)
+            q3 = group["total_fare"].quantile(0.75)
+            iqr = q3 - q1
+            filtered = group[(group["total_fare"] >= q1 - 1.5 * iqr) & (group["total_fare"] <= q3 + 1.5 * iqr)]
+            cleaned_frames.append(filtered)
 
-        if not daily_fares or len(daily_fares) < self.MIN_DATA_POINTS:
-            logger.warning(f"Insufficient data for {calc_date}: {len(daily_fares)} points")
-            return self._null_index(calc_date, "daily")
+        clean_df = pd.concat(cleaned_frames, ignore_index=True)
 
-        df = pd.DataFrame(daily_fares)
+        # 2. Compute Stratified Geometric Means (Jevons Elementary Aggregates)
+        strata_means = []
+        for (origin, dest, window), group in clean_df.groupby(["origin_iata", "destination_iata", "advance_purchase_window"]):
+            geom_mean = np.exp(np.log(group["total_fare"]).mean())
+            strata_means.append({
+                "route": f"{origin}-{dest}",
+                "origin": origin,
+                "destination": dest,
+                "window": window,
+                "geo_mean_fare": geom_mean,
+                "sample_size": len(group)
+            })
 
-        if "route_from" not in df.columns or "route_to" not in df.columns:
-            if "route_id" in df.columns:
-                df[["route_from", "route_to"]] = df["route_id"].str.split("-", expand=True)
+        strata_df = pd.DataFrame(strata_means)
 
-        route_groups = df.groupby(['route_from', 'route_to'])
-        weighted_fares = []
-        routes_included = []
-        route_stats = {}
-
-        for (route_from, route_to), group in route_groups:
-            route_id = f"{route_from}-{route_to}".upper()
-            routes_included.append(route_id)
-
-            weight = self.route_weights.get(route_id, 0.05)
-            avg_fare = float(group['total_price'].mean())
-            weighted_fares.append(avg_fare * weight)
-
-            route_stats[route_id] = {
-                "avg_fare": round(avg_fare, 2),
-                "count": int(len(group)),
-                "std": round(float(group['total_price'].std()), 2) if len(group) > 1 else 0.0,
-                "min": float(group['total_price'].min()),
-                "max": float(group['total_price'].max()),
-                "weight": weight
-            }
-
-        weighted_avg_fare = sum(weighted_fares)
-
-        base_weighted = sum(
-            self.base_fare_level.get(r_id, 4500.0) * self.route_weights.get(r_id, 0.05)
-            for r_id in routes_included
-        )
-
-        index_value = (weighted_avg_fare / base_weighted * 100.0) if base_weighted > 0 else 100.0
-
-        lower_ci, upper_ci, std_error = self._calculate_confidence_interval(df, routes_included)
-        quality_score = self._calculate_quality_score(len(df), len(routes_included), std_error, weighted_avg_fare)
-
-        return {
-            "date": calc_date.strftime("%Y-%m-%d"),
-            "index_value": round(float(index_value), 2),
-            "index_type": "daily",
-            "routes_included": routes_included,
-            "data_points": int(len(df)),
-            "routes_count": int(len(route_groups)),
-            "weighted_avg_fare": round(float(weighted_avg_fare), 2),
-            "lower_ci": round(float(lower_ci), 2),
-            "upper_ci": round(float(upper_ci), 2),
-            "std_error": round(float(std_error), 2),
-            "data_quality_score": round(float(quality_score), 3),
-            "route_stats": route_stats,
-            "timestamp": datetime.utcnow().isoformat()
+        # 3. Retrieve DGCA Traffic Weights
+        dgca_weights = {
+            "DEL-BOM": 0.24, "BOM-DEL": 0.24,
+            "DEL-BLR": 0.16, "BLR-DEL": 0.16,
+            "BOM-BLR": 0.12, "DEL-CCU": 0.10,
+            "DEL-HYD": 0.10, "BOM-MAA": 0.08,
+            "DEL-AMD": 0.08, "BOM-GOI": 0.06
         }
 
-    def _calculate_confidence_interval(
-        self, df: pd.DataFrame, routes_included: List[str], confidence: float = 0.95, n_bootstrap: int = 500
-    ) -> Tuple[float, float, float]:
-        prices = df['total_price'].values
-        if len(prices) < 2:
-            single = float(prices[0]) if len(prices) == 1 else 100.0
-            return single, single, 0.0
+        # 4. Weighted Aggregation Across Advance Windows & Routes
+        route_indices = []
+        for route_id, r_group in strata_df.groupby("route"):
+            route_weighted_fare = 0.0
+            total_window_wt = 0.0
+            for _, row in r_group.iterrows():
+                w = self.WINDOW_WEIGHTS.get(int(row["window"]), 0.1)
+                route_weighted_fare += row["geo_mean_fare"] * w
+                total_window_wt += w
 
-        bootstrap_means = []
-        for _ in range(n_bootstrap):
-            sample = np.random.choice(prices, size=len(prices), replace=True)
-            bootstrap_means.append(np.mean(sample))
+            normalized_route_fare = route_weighted_fare / total_window_wt if total_window_wt > 0 else route_weighted_fare
+            route_indices.append({
+                "route": route_id,
+                "composite_fare": normalized_route_fare,
+                "dgca_weight": dgca_weights.get(route_id, 0.05)
+            })
 
-        lower_pct = (1.0 - confidence) / 2.0 * 100.0
-        upper_pct = (1.0 + confidence) / 2.0 * 100.0
+        composite_df = pd.DataFrame(route_indices)
+        national_composite_fare = np.sum(composite_df["composite_fare"] * composite_df["dgca_weight"]) / np.sum(composite_df["dgca_weight"])
 
-        return (
-            float(np.percentile(bootstrap_means, lower_pct)),
-            float(np.percentile(bootstrap_means, upper_pct)),
-            float(np.std(bootstrap_means))
-        )
+        # Base period calibration (Reference Fare = ₹4,850.00 base standard)
+        BASE_CALIBRATION_PRICE = 4850.0
+        apix_index_value = (national_composite_fare / BASE_CALIBRATION_PRICE) * 100.0
 
-    def _calculate_quality_score(
-        self, data_points: int, routes_count: int, std_error: float, avg_fare: float
-    ) -> float:
-        volume_score = min(data_points / 20.0, 1.0) * 0.4
-        expected_routes = max(len(self.route_weights), 1)
-        route_score = min(routes_count / expected_routes, 1.0) * 0.3
-        consistency_score = max(1.0 - (std_error / avg_fare if avg_fare > 0 else 1.0), 0.0) * 0.2
-        return min(volume_score + route_score + consistency_score + 0.1, 1.0)
-
-    def _null_index(self, date: datetime, index_type: str) -> Dict:
-        return {
-            "date": date.strftime("%Y-%m-%d"),
-            "index_value": 100.0,
-            "index_type": index_type,
-            "routes_included": [],
-            "data_points": 0,
-            "data_quality_score": 0.0,
-            "is_valid": False,
-            "timestamp": datetime.utcnow().isoformat()
+        result_payload = {
+            "index_date": start_bound,
+            "apix_value": round(float(apix_index_value), 2),
+            "composite_price": round(float(national_composite_fare), 2),
+            "total_data_points": len(clean_df),
+            "routes_calculated": len(route_indices),
+            "calculated_at": datetime.now(timezone.utc),
         }
 
+        await self.db["index_history"].update_one(
+            {"index_date": start_bound},
+            {"$set": result_payload},
+            upsert=True
+        )
 
-# Global calculation engine instance
-index_engine = APIxCalculationEngine()
+        logger.info(f"Calculated APIx for {target_date.date()}: {apix_index_value:.2f} (from {len(clean_df)} observations)")
+        return result_payload 
+        # Instantiate global singleton instance for imports
+        index_engine = IndexCalculator()

@@ -1,42 +1,65 @@
 version: '3.8'
 
 services:
-  # Database
-  mongo:
-    image: mongo:6.0
+  # 1. MongoDB Database
+  mongodb:
+    image: mongo:7.0
     container_name: apix_mongodb
     restart: always
     ports:
       - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: apix_db
     volumes:
-      - apix_mongo_data:/data/db
+      - mongo_data:/data/db
+    networks:
+      - apix_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-  # FastAPI Backend Service
+  # 2. FastAPI Analytics & Index Engine
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: apix_backend
     restart: always
+    depends_on:
+      mongodb:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
-      - MONGO_URI=mongodb://mongo:27017/
+      - MONGODB_URI=mongodb://mongodb:27017
+      - DATABASE_NAME=apix_db
       - JWT_SECRET=apix-in-production-secret-key-2026
-    depends_on:
-      - mongo
+      - NODE_ENV=production
+    networks:
+      - apix_net
 
-  # React Frontend Dashboard
+  # 3. React Telemetry Dashboard (Vite + Nginx)
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: apix_frontend
     restart: always
-    ports:
-      - "5173:5173"
     depends_on:
       - backend
+    ports:
+      - "80:80"
+      - "5173:80"
+    networks:
+      - apix_net
 
 volumes:
-  apix_mongo_data:
+  mongo_data:
+    driver: local
+
+networks:
+  apix_net:
+    driver: bridge
