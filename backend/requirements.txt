@@ -32,3 +32,4 @@ pytz
 # Testing
 pytest
 pytest-asyncio
+aiohttp>=3.9.0
