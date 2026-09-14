@@ -1,0 +1,66 @@
+name: APIx Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-and-verify:
+    name: Backend Test Suite & Health Verification
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio httpx
+          playwright install --with-deps chromium
+
+      - name: Verify Stage 9 Ingestion & Scraper Engines
+        env:
+          MONGODB_URI: mongodb://localhost:27017/apix_db
+          DATABASE_NAME: apix_db
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+        run: |
+          python test_step9_9_base_scraper.py
+          python test_step9_10_airline_scrapers.py
+          python test_step9_11_ota_scrapers.py
+          python test_step9_12_master_orchestrator.py
+
+      - name: Verify Stage 10 Container Configurations
+        run: |
+          python test_stage10_docker.py

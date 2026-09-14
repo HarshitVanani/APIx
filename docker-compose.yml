@@ -1,7 +1,5 @@
-version: '3.8'
-
 services:
-  # 1. MongoDB Database
+  # 1. MongoDB Database Engine
   mongodb:
     image: mongo:7.0
     container_name: apix_mongodb
@@ -11,55 +9,82 @@ services:
     environment:
       MONGO_INITDB_DATABASE: apix_db
     volumes:
-      - mongo_data:/data/db
+      - mongodb_data:/data/db
     networks:
-      - apix_net
+      - apix_network
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
 
-  # 2. FastAPI Analytics & Index Engine
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: apix_backend
+  # 2. Redis In-Memory Cache
+  redis:
+    image: redis:7.2-alpine
+    container_name: apix_redis
     restart: always
-    depends_on:
-      mongodb:
-        condition: service_healthy
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - apix_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 3. Core FastAPI REST API Gateway
+  backend_api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: apix_backend_api
+    restart: always
     ports:
       - "8000:8000"
     environment:
-      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_URI=mongodb://mongodb:27017/apix_db
       - DATABASE_NAME=apix_db
-      - JWT_SECRET=apix-in-production-secret-key-2026
-      - NODE_ENV=production
-    networks:
-      - apix_net
-
-  # 3. React Telemetry Dashboard (Vite + Nginx)
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: apix_frontend
-    restart: always
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - JWT_SECRET=super_secret_apix_development_key_2026
     depends_on:
-      - backend
-    ports:
-      - "80:80"
-      - "5173:80"
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
-      - apix_net
+      - apix_network
 
-volumes:
-  mongo_data:
-    driver: local
+  # 4. Background Scraper & Scheduled Index Worker
+  scraper_worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: apix_scraper_worker
+    restart: always
+    command: ["python", "-m", "backend.tasks.scheduler"]
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017/apix_db
+      - DATABASE_NAME=apix_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - apix_network
 
 networks:
-  apix_net:
+  apix_network:
     driver: bridge
+
+volumes:
+  mongodb_data:
+  redis_data:
